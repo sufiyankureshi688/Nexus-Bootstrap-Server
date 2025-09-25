@@ -1,453 +1,352 @@
-// nexus-bootstrap-server.js - Production Bootstrap Server (FIXED VERSION)
 const express = require('express');
 const cors = require('cors');
-const rateLimit = require('express-rate-limit');
+const WebSocket = require('ws');
+const http = require('http');
 
-class NexusBootstrapServer {
-  constructor(port = 3000) {
-    this.port = port;
-    this.app = express();
-    this.activePeers = new Map(); // peerId -> peer data
-    this.peersByRegion = new Map(); // region -> Set(peerIds)
-    this.nodeStats = {
-      totalRegistrations: 0,
-      activePeers: 0,
-      official: 0,
-      forks: 0,
-      custom: 0,
-      peakPeers: 0,
-      startTime: Date.now()
-    };
-    
-    // Add missing properties
-    this.lastStatsLog = 0;
-    
-    this.setupMiddleware();
-    this.setupRoutes();
-    this.startCleanupTasks();
+const app = express();
+const server = http.createServer(app);
+
+// HARDCODED CONFIGURATION (no .env dependency)
+const CONFIG = {
+  PORT: 3000,
+  SERVER_ID: 'nexus-bootstrap-1',
+  NODE_ENV: 'production',
+  MAX_PEERS: 50,
+  CLEANUP_INTERVAL: 120000, // 2 minutes
+  PEER_TIMEOUT: 600000 // 10 minutes
+};
+
+// Enable CORS for all routes
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+app.use(express.json());
+
+// In-memory peer storage (simple and fast)
+class PeerManager {
+  constructor() {
+    this.peers = new Map();
+    this.connections = new Map(); // WebSocket connections
+    this.lastCleanup = Date.now();
   }
 
-  setupMiddleware() {
-    this.app.use(cors({
-      origin: '*', // Allow React Native apps
-      methods: ['GET', 'POST', 'PUT', 'DELETE'],
-      headers: ['Content-Type', 'Authorization']
-    }));
-    
-    this.app.use(express.json({ limit: '10mb' }));
-    
-    // Rate limiting for mobile apps
-    const limiter = rateLimit({
-      windowMs: 1 * 60 * 1000, // 1 minute
-      max: 100, // 100 requests per minute per IP
-      message: { error: 'Too many requests' }
-    });
-    this.app.use(limiter);
-    
-    // Request logging
-    this.app.use((req, res, next) => {
-      console.log(`${new Date().toISOString()} ${req.method} ${req.path} - ${req.ip}`);
-      next();
-    });
-  }
-
-  setupRoutes() {
-    // Health check
-    this.app.get('/health', (req, res) => {
-      res.json({
-        status: 'healthy',
-        uptime: Date.now() - this.nodeStats.startTime,
-        activePeers: this.activePeers.size,
-        memory: process.memoryUsage(),
-        timestamp: Date.now()
-      });
-    });
-
-    // Main bootstrap endpoint
-    this.app.post('/register', async (req, res) => {
-      try {
-        const result = await this.handlePeerRegistration(req.body, req.ip);
-        res.json(result);
-      } catch (error) {
-        console.error('Registration failed:', error);
-        res.status(500).json({ error: 'Registration failed' });
-      }
-    });
-
-    // Get network statistics
-    this.app.get('/stats', (req, res) => {
-      const appVariants = this.getAppVariants();
-      res.json({
-        ...this.nodeStats,
-        activePeers: this.activePeers.size,
-        appVariants,
-        regionDistribution: this.getRegionDistribution(),
-        recentActivity: this.getRecentActivity()
-      });
-    });
-
-    // Peer lookup for DHT queries
-    this.app.get('/peers/:nodeId', (req, res) => {
-      const { nodeId } = req.params;
-      const peer = this.activePeers.get(nodeId);
-      
-      if (peer) {
-        res.json({
-          found: true,
-          peer: {
-            nodeId,
-            address: peer.address,
-            lastSeen: peer.lastSeen,
-            classification: peer.classification
-          }
-        });
-      } else {
-        res.status(404).json({ found: false });
-      }
-    });
-
-    // Heartbeat endpoint for keeping peers alive
-    this.app.post('/heartbeat', (req, res) => {
-      const { nodeId } = req.body;
-      if (nodeId && this.activePeers.has(nodeId)) {
-        const peer = this.activePeers.get(nodeId);
-        peer.lastSeen = Date.now();
-        peer.heartbeats = (peer.heartbeats || 0) + 1;
-        
-        res.json({ 
-          success: true, 
-          nextHeartbeat: Date.now() + 120000 // 2 minutes
-        });
-      } else {
-        res.status(404).json({ error: 'Peer not found' });
-      }
-    });
-
-    // Graceful shutdown
-    this.app.post('/unregister', (req, res) => {
-      const { nodeId } = req.body;
-      if (nodeId && this.activePeers.has(nodeId)) {
-        this.removePeer(nodeId);
-        res.json({ success: true });
-      } else {
-        res.json({ success: false, error: 'Peer not found' });
-      }
-    });
-
-    // Error handling
-    this.app.use((error, req, res, next) => {
-      console.error('Server error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    });
-  }
-
-  async handlePeerRegistration(peerData, clientIP) {
-    const { peerId, address, port, metadata = {} } = peerData;
-    
-    if (!peerId || !address) {
-      throw new Error('Missing required fields: peerId, address');
-    }
-
-    // Classify the peer
-    const classification = this.classifyPeer(metadata);
-    
-    // Create peer record
-    const peerRecord = {
-      nodeId: peerId,
-      address: `${address}:${port || 8080}`,
-      clientIP,
-      classification,
-      metadata: {
-        ...metadata,
-        userAgent: metadata.userAgent || 'Unknown',
-        platform: metadata.deviceInfo?.platform || 'unknown',
-        appVersion: metadata.appVersion || 'unknown',
-        capabilities: metadata.capabilities || []
-      },
-      registeredAt: Date.now(),
+  addPeer(peerId, peerData) {
+    const peer = {
+      id: peerId,
+      ...peerData,
       lastSeen: Date.now(),
-      heartbeats: 0,
-      region: this.detectRegion(clientIP)
+      joined: Date.now()
     };
-
-    // Store peer
-    this.activePeers.set(peerId, peerRecord);
-    this.addToRegion(peerRecord.region, peerId);
-    this.updateStats(classification);
-
-    console.log(`✅ Peer registered: ${classification.appVariant} - ${peerId.substring(0, 8)}...`);
-
-    // Return bootstrap peers
-    const bootstrapPeers = this.selectBootstrapPeers(peerId, peerRecord.region, classification);
     
-    return {
-      success: true,
-      nodeId: peerId,
-      assignedRegion: peerRecord.region,
-      classification,
-      peers: bootstrapPeers,
-      networkStats: {
-        totalPeers: this.activePeers.size,
-        ...this.nodeStats
-      },
-      nextHeartbeat: Date.now() + 120000,
-      bootstrapInfo: {
-        recommendedPeers: bootstrapPeers.length,
-        networkHealth: this.calculateNetworkHealth()
-      }
-    };
-  }
-
-  classifyPeer(metadata) {
-    const officialBundleIds = [
-      "com.sufiyan.m1.Nexus",
-      "com.nexus.mobile.v1"
-    ];
-
-    let appVariant = "custom";
-    let trustLevel = "untrusted";
-
-    if (officialBundleIds.includes(metadata.bundleId)) {
-      appVariant = "official";
-      trustLevel = "trusted";
-    } else if (metadata.appName?.toLowerCase().includes('nexus')) {
-      appVariant = "fork";
-      trustLevel = "semi-trusted";
-    }
-
-    return {
-      appVariant,
-      trustLevel,
-      appName: metadata.appName || "Unknown",
-      appVersion: metadata.appVersion || "Unknown",
-      bundleId: metadata.bundleId || "Unknown",
-      userAgent: metadata.userAgent || "Unknown",
-      isOfficial: appVariant === "official"
-    };
-  }
-
-  selectBootstrapPeers(requestingPeerId, region, classification) {
-    const maxPeers = 10;
-    const peers = [];
-    
-    // Priority 1: Same region, official app peers
-    const officialSameRegion = this.getPeersByFilter(p => 
-      p.classification.appVariant === 'official' && 
-      p.region === region &&
-      p.nodeId !== requestingPeerId
-    ).slice(0, 4);
-    peers.push(...officialSameRegion);
-
-    // Priority 2: Same region, any trusted peers
-    if (peers.length < maxPeers) {
-      const trustedSameRegion = this.getPeersByFilter(p => 
-        p.classification.trustLevel !== 'untrusted' && 
-        p.region === region &&
-        p.nodeId !== requestingPeerId &&
-        !peers.find(existing => existing.nodeId === p.nodeId)
-      ).slice(0, maxPeers - peers.length);
-      peers.push(...trustedSameRegion);
-    }
-
-    // Priority 3: Other regions if needed
-    if (peers.length < 3) {
-      const globalPeers = this.getPeersByFilter(p => 
-        p.nodeId !== requestingPeerId &&
-        !peers.find(existing => existing.nodeId === p.nodeId)
-      ).slice(0, maxPeers - peers.length);
-      peers.push(...globalPeers);
-    }
-
-    return peers.map(p => ({
-      nodeId: p.nodeId,
-      address: p.address,
-      classification: p.classification,
-      region: p.region,
-      lastSeen: p.lastSeen
-    }));
-  }
-
-  detectRegion(clientIP) {
-    // Simple region detection - you can enhance this
-    if (clientIP.startsWith('192.168.') || clientIP === '127.0.0.1') {
-      return 'local';
-    }
-    
-    // You can integrate with MaxMind GeoIP or similar service
-    // For now, use simple heuristics
-    const hash = this.simpleHash(clientIP);
-    const regions = ['us-east', 'us-west', 'eu-west', 'asia-pacific'];
-    return regions[hash % regions.length];
-  }
-
-  startCleanupTasks() {
-    // Clean up inactive peers every 2 minutes
-    setInterval(() => {
-      this.cleanupInactivePeers();
-    }, 120000);
-
-    // Update statistics every 30 seconds
-    setInterval(() => {
-      this.recalculateStats();
-    }, 30000);
-
-    // Log network status every 5 minutes
-    setInterval(() => {
-      console.log(`📊 Network Status: ${this.activePeers.size} active peers`);
-      console.log(`   Official: ${this.nodeStats.official}, Forks: ${this.nodeStats.forks}, Custom: ${this.nodeStats.custom}`);
-    }, 300000);
-  }
-
-  // FIXED: Add missing recalculateStats method
-  recalculateStats() {
-    // Recalculate peer counts by classification
-    this.nodeStats.official = 0;
-    this.nodeStats.forks = 0;
-    this.nodeStats.custom = 0;
-    
-    for (const peer of this.activePeers.values()) {
-      switch (peer.classification.appVariant) {
-        case 'official':
-          this.nodeStats.official++;
-          break;
-        case 'fork':
-          this.nodeStats.forks++;
-          break;
-        default:
-          this.nodeStats.custom++;
-          break;
-      }
-    }
-    
-    // Update peak peer count
-    this.nodeStats.peakPeers = Math.max(this.nodeStats.peakPeers, this.activePeers.size);
-    
-    // Log stats periodically
-    const now = Date.now();
-    if (now - this.lastStatsLog > 300000) { // Every 5 minutes
-      console.log(`📊 Stats updated: ${this.activePeers.size} peers (${this.nodeStats.official} official, ${this.nodeStats.forks} forks, ${this.nodeStats.custom} custom)`);
-      this.lastStatsLog = now;
-    }
-  }
-
-  cleanupInactivePeers() {
-    const cutoffTime = Date.now() - 300000; // 5 minutes timeout
-    let cleaned = 0;
-    
-    for (const [peerId, peer] of this.activePeers) {
-      if (peer.lastSeen < cutoffTime) {
-        this.removePeer(peerId);
-        cleaned++;
-      }
-    }
-    
-    if (cleaned > 0) {
-      console.log(`🧹 Cleaned up ${cleaned} inactive peers`);
-    }
+    this.peers.set(peerId, peer);
+    console.log(`Peer joined: ${peerId} (Total: ${this.peers.size})`);
+    return peer;
   }
 
   removePeer(peerId) {
-    const peer = this.activePeers.get(peerId);
+    const removed = this.peers.delete(peerId);
+    this.connections.delete(peerId);
+    if (removed) {
+      console.log(`Peer left: ${peerId} (Total: ${this.peers.size})`);
+    }
+    return removed;
+  }
+
+  updatePeerActivity(peerId) {
+    const peer = this.peers.get(peerId);
     if (peer) {
-      this.activePeers.delete(peerId);
-      this.removeFromRegion(peer.region, peerId);
+      peer.lastSeen = Date.now();
+      this.peers.set(peerId, peer);
     }
   }
 
-  // FIXED: Add missing getRegionDistribution method
-  getRegionDistribution() {
-    const distribution = {};
-    for (const [region, peerSet] of this.peersByRegion) {
-      distribution[region] = peerSet.size;
-    }
-    return distribution;
-  }
-
-  // FIXED: Add missing getRecentActivity method
-  getRecentActivity() {
-    const cutoff = Date.now() - 300000; // Last 5 minutes
-    return Array.from(this.activePeers.values())
-      .filter(peer => peer.registeredAt > cutoff)
-      .map(peer => ({
-        nodeId: peer.nodeId.substring(0, 8) + '...',
-        appVariant: peer.classification.appVariant,
-        region: peer.region,
-        registeredAt: peer.registeredAt
-      }));
-  }
-
-  // Utility methods
-  getPeersByFilter(filterFn) {
-    return Array.from(this.activePeers.values()).filter(filterFn);
-  }
-
-  addToRegion(region, peerId) {
-    if (!this.peersByRegion.has(region)) {
-      this.peersByRegion.set(region, new Set());
-    }
-    this.peersByRegion.get(region).add(peerId);
-  }
-
-  removeFromRegion(region, peerId) {
-    if (this.peersByRegion.has(region)) {
-      this.peersByRegion.get(region).delete(peerId);
-    }
-  }
-
-  updateStats(classification) {
-    this.nodeStats.totalRegistrations++;
-    if (classification.appVariant === 'official') this.nodeStats.official++;
-    else if (classification.appVariant === 'fork') this.nodeStats.forks++;
-    else this.nodeStats.custom++;
+  getActivePeers(maxAge = 300000) { // 5 minutes default
+    const now = Date.now();
+    const activePeers = [];
     
-    this.nodeStats.peakPeers = Math.max(this.nodeStats.peakPeers, this.activePeers.size);
-  }
-
-  simpleHash(str) {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-      hash = ((hash << 5) - hash + str.charCodeAt(i)) & 0xffffffff;
+    for (const [peerId, peer] of this.peers) {
+      if (now - peer.lastSeen < maxAge) {
+        activePeers.push(peer);
+      }
     }
-    return Math.abs(hash);
+    
+    return activePeers;
   }
 
-  getAppVariants() {
-    const variants = {};
-    for (const peer of this.activePeers.values()) {
-      const key = peer.classification.appVariant;
-      variants[key] = (variants[key] || 0) + 1;
+  cleanupStalePeers(maxAge = CONFIG.PEER_TIMEOUT) {
+    const now = Date.now();
+    const stalePeers = [];
+    
+    for (const [peerId, peer] of this.peers) {
+      if (now - peer.lastSeen > maxAge) {
+        stalePeers.push(peerId);
+      }
     }
-    return variants;
+    
+    stalePeers.forEach(peerId => this.removePeer(peerId));
+    return stalePeers.length;
   }
 
-  calculateNetworkHealth() {
-    const totalPeers = this.activePeers.size;
-    if (totalPeers === 0) return 0;
+  getRandomPeers(count = 10, excludePeerId = null) {
+    const activePeers = this.getActivePeers().filter(peer => peer.id !== excludePeerId);
     
-    const officialRatio = this.nodeStats.official / totalPeers;
-    const regionDistribution = this.peersByRegion.size;
-    
-    // Health score based on peer count, official ratio, and distribution
-    return Math.min(100, 
-      (totalPeers * 2) + 
-      (officialRatio * 30) + 
-      (regionDistribution * 5)
-    );
+    // Shuffle and return up to count peers
+    const shuffled = activePeers.sort(() => 0.5 - Math.random());
+    return shuffled.slice(0, count);
   }
+}
 
-  start() {
-    this.app.listen(this.port, '0.0.0.0', () => {
-      console.log(`🚀 Nexus Bootstrap Server running on port ${this.port}`);
-      console.log(`📡 Ready to bootstrap P2P network`);
+const peerManager = new PeerManager();
+
+// Cleanup stale peers automatically
+setInterval(() => {
+  const cleanedUp = peerManager.cleanupStalePeers();
+  if (cleanedUp > 0) {
+    console.log(`Cleaned up ${cleanedUp} stale peers`);
+  }
+}, CONFIG.CLEANUP_INTERVAL);
+
+// API Routes
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: Date.now(),
+    serverId: CONFIG.SERVER_ID,
+    totalPeers: peerManager.peers.size,
+    activePeers: peerManager.getActivePeers().length,
+    uptime: process.uptime()
+  });
+});
+
+// MAIN ENDPOINT: Get peer list for DHT bootstrap
+app.get('/peers', (req, res) => {
+  try {
+    const requestingPeerId = req.query.peerId;
+    const maxPeers = parseInt(req.query.limit) || 10;
+    
+    const peers = peerManager.getRandomPeers(maxPeers, requestingPeerId);
+    
+    res.json({
+      success: true,
+      peers: peers.map(peer => ({
+        id: peer.id,
+        address: peer.address || 'unknown',
+        port: peer.port || 8080,
+        lastSeen: peer.lastSeen,
+        capabilities: peer.capabilities || ['dht', 'webrtc']
+      })),
+      totalAvailable: peerManager.getActivePeers().length,
+      bootstrapServer: CONFIG.SERVER_ID,
+      timestamp: Date.now()
     });
+  } catch (error) {
+    console.error('Error getting peers:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
-}
+});
 
-// Start server if this file is run directly
-if (require.main === module) {
-  const port = process.env.PORT || 3000;
-  const server = new NexusBootstrapServer(port);
-  server.start();
-}
+// Register peer with network
+app.post('/announce', (req, res) => {
+  try {
+    const { peerId, address, port, capabilities } = req.body;
+    
+    if (!peerId) {
+      return res.status(400).json({ success: false, error: 'peerId is required' });
+    }
+    
+    const peer = peerManager.addPeer(peerId, {
+      address: address || req.ip,
+      port: port || 8080,
+      capabilities: capabilities || ['dht', 'webrtc']
+    });
+    
+    res.json({
+      success: true,
+      peer,
+      message: 'Peer announced successfully',
+      bootstrapServer: CONFIG.SERVER_ID
+    });
+  } catch (error) {
+    console.error('Error announcing peer:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
 
-module.exports = NexusBootstrapServer;
+// Update peer activity (heartbeat)
+app.post('/heartbeat', (req, res) => {
+  try {
+    const { peerId } = req.body;
+    
+    if (!peerId) {
+      return res.status(400).json({ success: false, error: 'peerId is required' });
+    }
+    
+    peerManager.updatePeerActivity(peerId);
+    
+    res.json({
+      success: true,
+      message: 'Heartbeat updated',
+      timestamp: Date.now()
+    });
+  } catch (error) {
+    console.error('Error updating heartbeat:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// WebRTC Signaling endpoint
+app.post('/signal', (req, res) => {
+  try {
+    const { to, from, message } = req.body;
+    
+    if (!to || !from || !message) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'to, from, and message are required' 
+      });
+    }
+    
+    // Forward via WebSocket if available
+    const targetConnection = peerManager.connections.get(to);
+    if (targetConnection && targetConnection.readyState === WebSocket.OPEN) {
+      targetConnection.send(JSON.stringify({
+        type: 'signaling',
+        from,
+        to,
+        message
+      }));
+      
+      res.json({ success: true, message: 'Signal forwarded via WebSocket' });
+    } else {
+      res.json({ 
+        success: false, 
+        error: 'Target peer not connected',
+        suggestion: 'Peer should connect via WebSocket for signaling'
+      });
+    }
+  } catch (error) {
+    console.error('Error handling signal:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Network statistics
+app.get('/stats', (req, res) => {
+  const stats = {
+    serverId: CONFIG.SERVER_ID,
+    totalPeers: peerManager.peers.size,
+    activePeers: peerManager.getActivePeers().length,
+    webSocketConnections: peerManager.connections.size,
+    uptime: process.uptime(),
+    memoryUsage: process.memoryUsage(),
+    timestamp: Date.now()
+  };
+  
+  res.json(stats);
+});
+
+// WebSocket server for real-time signaling
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', (ws, req) => {
+  let peerId = null;
+  
+  console.log('New WebSocket connection established');
+  
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data);
+      
+      switch (message.type) {
+        case 'register':
+          peerId = message.peerId;
+          if (peerId) {
+            peerManager.connections.set(peerId, ws);
+            peerManager.updatePeerActivity(peerId);
+            console.log(`Peer ${peerId} registered WebSocket`);
+            
+            ws.send(JSON.stringify({
+              type: 'registered',
+              peerId,
+              serverId: CONFIG.SERVER_ID,
+              timestamp: Date.now()
+            }));
+          }
+          break;
+          
+        case 'signaling':
+          const { to, from, signalingMessage } = message;
+          const targetConnection = peerManager.connections.get(to);
+          
+          if (targetConnection && targetConnection.readyState === WebSocket.OPEN) {
+            targetConnection.send(JSON.stringify({
+              type: 'signaling',
+              from,
+              to,
+              message: signalingMessage
+            }));
+          }
+          break;
+          
+        case 'heartbeat':
+          if (message.peerId) {
+            peerManager.updatePeerActivity(message.peerId);
+          }
+          break;
+          
+        default:
+          console.log('Unknown WebSocket message type:', message.type);
+      }
+    } catch (error) {
+      console.error('Error parsing WebSocket message:', error);
+    }
+  });
+  
+  ws.on('close', () => {
+    if (peerId) {
+      peerManager.connections.delete(peerId);
+      console.log(`Peer ${peerId} disconnected from WebSocket`);
+    }
+  });
+  
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
+  });
+});
+
+// Start server with hardcoded port
+const PORT = CONFIG.PORT;
+server.listen(PORT, () => {
+  console.log(`=================================`);
+  console.log(`Nexus Bootstrap Server RUNNING`);
+  console.log(`=================================`);
+  console.log(`Server ID: ${CONFIG.SERVER_ID}`);
+  console.log(`Port: ${PORT}`);
+  console.log(`Environment: ${CONFIG.NODE_ENV}`);
+  console.log(`HTTP API: http://localhost:${PORT}`);
+  console.log(`WebSocket: ws://localhost:${PORT}`);
+  console.log(`Health Check: http://localhost:${PORT}/health`);
+  console.log(`=================================`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('Shutting down gracefully...');
+  server.close(() => {
+    console.log('Nexus Bootstrap Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('\nReceived SIGINT, shutting down...');
+  server.close(() => {
+    console.log('Nexus Bootstrap Server closed');
+    process.exit(0);
+  });
+});
