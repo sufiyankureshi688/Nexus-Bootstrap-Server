@@ -2,50 +2,55 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const crypto = require('crypto'); // Node built-in, no install needed
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
 
-// CORS configuration
 app.use(cors());
 app.use(express.json());
 
-// Socket.IO with CORS - FIXED for React Native
+// Socket.IO with enhanced CORS
 const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"],
     credentials: true
   },
-  transports: ['polling', 'websocket'],  // Add polling first
-  allowEIO3: true  // Compatibility
+  transports: ['polling', 'websocket'],
+  allowEIO3: true
 });
 
-// Peer registry
+// Enhanced peer storage with metadata
 const peers = new Map();
 
-// DHT routing table (simplified)
 class DHTNode {
   constructor() {
     this.routingTable = new Map();
   }
 
-  addPeer(peerId, walletAddress, socketId) {
+  addPeer(peerId, walletAddress, socketId, metadata = {}) {
     this.routingTable.set(peerId, {
       id: peerId,
       walletAddress,
       socketId,
+      username: metadata.username,
+      displayName: metadata.displayName,
+      bio: metadata.bio,
       lastSeen: Date.now(),
       connections: 0
     });
-    console.log(`✅ Peer added to DHT: ${walletAddress.substring(0, 8)}... (${this.routingTable.size} total)`);
+    console.log(
+      `✅ Peer added: ${metadata.username || walletAddress.substring(0, 8)}... (${this.routingTable.size} total)`
+    );
   }
 
   removePeer(peerId) {
     const peer = this.routingTable.get(peerId);
     if (peer) {
-      console.log(`❌ Peer removed from DHT: ${peer.walletAddress.substring(0, 8)}...`);
+      console.log(
+        `❌ Peer removed: ${peer.username || peer.walletAddress.substring(0, 8)}...`
+      );
       this.routingTable.delete(peerId);
     }
   }
@@ -112,10 +117,11 @@ const dht = new DHTNode();
 // HTTP Routes
 app.get('/', (req, res) => {
   res.json({
-    name: 'Nexus Bootstrap Server',
-    version: '1.0.0',
+    name: 'Nexus Bootstrap Server (Enhanced)',
+    version: '2.0.0',
     peers: dht.getPeerCount(),
-    uptime: Math.floor(process.uptime())
+    uptime: Math.floor(process.uptime()),
+    features: ['gossip', 'metadata', 'crawling']
   });
 });
 
@@ -131,8 +137,9 @@ app.get('/peers', (req, res) => {
   const allPeers = dht.getAllPeers().map(p => ({
     id: p.id,
     walletAddress: p.walletAddress,
+    username: p.username,
+    displayName: p.displayName,
     lastSeen: p.lastSeen,
-    connections: p.connections
   }));
   
   res.json({
@@ -156,8 +163,9 @@ io.on('connection', (socket) => {
   
   let currentPeerId = null;
 
+  // ENHANCED: Register with metadata
   socket.on('register', (data) => {
-    const { walletAddress, peerId } = data;
+    const { walletAddress, peerId, username, displayName, bio } = data;
     
     if (!walletAddress) {
       socket.emit('error', { message: 'Wallet address required' });
@@ -166,12 +174,20 @@ io.on('connection', (socket) => {
 
     currentPeerId = peerId || socket.id;
     
-    dht.addPeer(currentPeerId, walletAddress, socket.id);
+    // Store with metadata
+    dht.addPeer(currentPeerId, walletAddress, socket.id, {
+      username,
+      displayName,
+      bio
+    });
     
     peers.set(socket.id, {
       id: currentPeerId,
       walletAddress,
       socketId: socket.id,
+      username,
+      displayName,
+      bio,
       connectedAt: Date.now()
     });
 
@@ -180,17 +196,23 @@ io.on('connection', (socket) => {
       bootstrapNode: true
     });
 
+    // Broadcast to all OTHER peers (not yourself)
     socket.broadcast.emit('peer-joined', {
       peerId: currentPeerId,
-      walletAddress
+      walletAddress,
+      username,
+      displayName,
+      bio
     });
 
-    console.log(`✅ Peer registered: ${walletAddress.substring(0, 8)}... as ${currentPeerId}`);
+    console.log(
+      `✅ Peer registered: ${username || walletAddress.substring(0, 8)}... as ${currentPeerId.substring(0, 8)}`
+    );
   });
 
   socket.on('find-node', (data) => {
     const { targetWalletAddress, k } = data;
-    console.log(`🔍 Find node request for: ${targetWalletAddress?.substring(0, 8)}...`);
+    console.log(`🔍 Find node: ${targetWalletAddress?.substring(0, 8)}...`);
 
     const closestPeers = dht.findClosestPeers(targetWalletAddress, k || 20);
     
@@ -198,20 +220,49 @@ io.on('connection', (socket) => {
       peers: closestPeers.map(p => ({
         id: p.id,
         walletAddress: p.walletAddress,
+        username: p.username,
+        displayName: p.displayName,
+        bio: p.bio,
         socketId: p.socketId
       }))
     });
 
-    console.log(`📤 Sent ${closestPeers.length} closest peers`);
+    console.log(`📤 Sent ${closestPeers.length} peers`);
   });
 
   socket.on('get-peers', () => {
     const allPeers = dht.getAllPeers().map(p => ({
       id: p.id,
-      walletAddress: p.walletAddress
+      walletAddress: p.walletAddress,
+      username: p.username,
+      displayName: p.displayName,
+      bio: p.bio
     }));
 
     socket.emit('peers-list', { peers: allPeers });
+  });
+
+  // NEW: Gossip broadcast (to ALL peers)
+  socket.on('gossip', (message) => {
+    console.log(`📢 Gossip from ${message.sender.substring(0, 8)}: ${message.type}`);
+    
+    // Broadcast to ALL other peers
+    socket.broadcast.emit('gossip', message);
+  });
+
+  // NEW: Gossip to specific peer
+  socket.on('gossip_to', (data) => {
+    const { to, message } = data;
+    
+    // Find target peer's socket
+    const targetPeer = Array.from(peers.values()).find(p => p.id === to);
+    
+    if (targetPeer) {
+      io.to(targetPeer.socketId).emit('gossip', message);
+      console.log(`📨 Gossip forwarded to ${to.substring(0, 8)}`);
+    } else {
+      socket.emit('error', { message: 'Peer not found', peerId: to });
+    }
   });
 
   socket.on('signal', (data) => {
@@ -224,7 +275,7 @@ io.on('connection', (socket) => {
         from,
         signal
       });
-      console.log(`📨 Forwarded signal: ${from?.substring(0, 8)} → ${to?.substring(0, 8)}`);
+      console.log(`📨 Signal: ${from?.substring(0, 8)} → ${to?.substring(0, 8)}`);
     } else {
       socket.emit('error', { message: 'Peer not found', peerId: to });
     }
@@ -275,16 +326,16 @@ const PORT = process.env.PORT || 10000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔════════════════════════════════════════╗
-║   Nexus Bootstrap Server Running      ║
+║   Nexus Bootstrap Server v2.0         ║
 ║   Port: ${PORT}                         ║
-║   Environment: ${process.env.NODE_ENV || 'production'}
+║   Features: Gossip + Metadata         ║
 ╚════════════════════════════════════════╝
   `);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('🛑 SIGTERM received, shutting down gracefully...');
+  console.log('🛑 Shutting down gracefully...');
   server.close(() => {
     console.log('✅ Server closed');
     process.exit(0);
@@ -296,5 +347,5 @@ process.on('uncaughtException', (error) => {
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+  console.error('❌ Unhandled Rejection:', promise, 'reason:', reason);
 });
