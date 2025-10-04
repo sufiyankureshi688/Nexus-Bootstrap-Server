@@ -1,22 +1,25 @@
 {
   "name": "nexus-bootstrap-server",
   "version": "1.0.0",
-  "description": "Bootstrap server for Nexus P2P network - peer discovery and WebRTC signaling",
+  "description": "Bootstrap and signaling server for Nexus P2P network",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js",
-    "test": "node -e \"console.log('Server ready for deployment')\""
+    "dev": "nodemon server.js"
   },
+  "keywords": ["p2p", "dht", "bootstrap", "webrtc"],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
-    "cors": "^2.8.5", 
-    "ws": "^8.14.2"
+    "socket.io": "^4.6.0",
+    "cors": "^2.8.5",
+    "crypto": "^1.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=14.0.0"
-  },
-  "keywords": ["p2p", "bootstrap", "webrtc", "dht", "nexus"],
-  "author": "Nexus P2P Network",
-  "license": "MIT"
+    "node": ">=16.0.0"
+  }
 }
