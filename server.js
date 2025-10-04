@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const crypto = require('crypto');
+const crypto = require('crypto'); // Node built-in, no install needed
 
 const app = express();
 const server = http.createServer(app);
@@ -11,18 +11,19 @@ const server = http.createServer(app);
 app.use(cors());
 app.use(express.json());
 
-// Socket.IO with CORS
+// Socket.IO with CORS - FIXED for React Native
 const io = new Server(server, {
   cors: {
     origin: "*",
-    methods: ["GET", "POST"]
+    methods: ["GET", "POST"],
+    credentials: true
   },
-  transports: ['websocket', 'polling']
+  transports: ['polling', 'websocket'],  // Add polling first
+  allowEIO3: true  // Compatibility
 });
 
 // Peer registry
 const peers = new Map();
-const peerConnections = new Map();
 
 // DHT routing table (simplified)
 class DHTNode {
@@ -114,7 +115,7 @@ app.get('/', (req, res) => {
     name: 'Nexus Bootstrap Server',
     version: '1.0.0',
     peers: dht.getPeerCount(),
-    uptime: process.uptime()
+    uptime: Math.floor(process.uptime())
   });
 });
 
@@ -144,7 +145,7 @@ app.get('/stats', (req, res) => {
   res.json({
     totalPeers: dht.getPeerCount(),
     activeConnections: io.sockets.sockets.size,
-    uptime: process.uptime(),
+    uptime: Math.floor(process.uptime()),
     memory: process.memoryUsage()
   });
 });
@@ -155,7 +156,6 @@ io.on('connection', (socket) => {
   
   let currentPeerId = null;
 
-  // Peer registration
   socket.on('register', (data) => {
     const { walletAddress, peerId } = data;
     
@@ -166,10 +166,8 @@ io.on('connection', (socket) => {
 
     currentPeerId = peerId || socket.id;
     
-    // Add to DHT
     dht.addPeer(currentPeerId, walletAddress, socket.id);
     
-    // Store peer info
     peers.set(socket.id, {
       id: currentPeerId,
       walletAddress,
@@ -177,13 +175,11 @@ io.on('connection', (socket) => {
       connectedAt: Date.now()
     });
 
-    // Send confirmation
     socket.emit('registered', {
       peerId: currentPeerId,
       bootstrapNode: true
     });
 
-    // Broadcast new peer to others
     socket.broadcast.emit('peer-joined', {
       peerId: currentPeerId,
       walletAddress
@@ -192,7 +188,6 @@ io.on('connection', (socket) => {
     console.log(`✅ Peer registered: ${walletAddress.substring(0, 8)}... as ${currentPeerId}`);
   });
 
-  // DHT: Find node
   socket.on('find-node', (data) => {
     const { targetWalletAddress, k } = data;
     console.log(`🔍 Find node request for: ${targetWalletAddress?.substring(0, 8)}...`);
@@ -210,7 +205,6 @@ io.on('connection', (socket) => {
     console.log(`📤 Sent ${closestPeers.length} closest peers`);
   });
 
-  // Get all peers
   socket.on('get-peers', () => {
     const allPeers = dht.getAllPeers().map(p => ({
       id: p.id,
@@ -220,11 +214,9 @@ io.on('connection', (socket) => {
     socket.emit('peers-list', { peers: allPeers });
   });
 
-  // WebRTC Signaling: Forward signals between peers
   socket.on('signal', (data) => {
     const { to, from, signal } = data;
     
-    // Find target peer
     const targetPeer = Array.from(peers.values()).find(p => p.id === to);
     
     if (targetPeer) {
@@ -238,16 +230,13 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Peer announcement (gossip)
   socket.on('announce', (data) => {
     socket.broadcast.emit('peer-announcement', data);
   });
 
-  // Ping/Pong for keepalive
   socket.on('ping', () => {
     socket.emit('pong', { timestamp: Date.now() });
     
-    // Update last seen
     if (currentPeerId) {
       const peer = dht.routingTable.get(currentPeerId);
       if (peer) {
@@ -256,14 +245,12 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Disconnect
   socket.on('disconnect', () => {
     console.log(`🔌 Disconnected: ${socket.id}`);
     
     if (currentPeerId) {
       dht.removePeer(currentPeerId);
       
-      // Notify other peers
       socket.broadcast.emit('peer-left', {
         peerId: currentPeerId
       });
@@ -272,7 +259,6 @@ io.on('connection', (socket) => {
     peers.delete(socket.id);
   });
 
-  // Error handling
   socket.on('error', (error) => {
     console.error('Socket error:', error);
   });
@@ -281,17 +267,17 @@ io.on('connection', (socket) => {
 // Periodic cleanup
 setInterval(() => {
   dht.cleanup();
-}, 5 * 60 * 1000); // Every 5 minutes
+}, 5 * 60 * 1000);
 
 // Server startup
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔════════════════════════════════════════╗
 ║   Nexus Bootstrap Server Running      ║
 ║   Port: ${PORT}                         ║
-║   Environment: ${process.env.NODE_ENV || 'development'}
+║   Environment: ${process.env.NODE_ENV || 'production'}
 ╚════════════════════════════════════════╝
   `);
 });
@@ -303,4 +289,12 @@ process.on('SIGTERM', () => {
     console.log('✅ Server closed');
     process.exit(0);
   });
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });
