@@ -1,352 +1,306 @@
 const express = require('express');
-const cors = require('cors');
-const WebSocket = require('ws');
 const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
 
-// HARDCODED CONFIGURATION (no .env dependency)
-const CONFIG = {
-  PORT: 3000,
-  SERVER_ID: 'nexus-bootstrap-1',
-  NODE_ENV: 'production',
-  MAX_PEERS: 50,
-  CLEANUP_INTERVAL: 120000, // 2 minutes
-  PEER_TIMEOUT: 600000 // 10 minutes
-};
-
-// Enable CORS for all routes
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-
+// CORS configuration
+app.use(cors());
 app.use(express.json());
 
-// In-memory peer storage (simple and fast)
-class PeerManager {
+// Socket.IO with CORS
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  },
+  transports: ['websocket', 'polling']
+});
+
+// Peer registry
+const peers = new Map();
+const peerConnections = new Map();
+
+// DHT routing table (simplified)
+class DHTNode {
   constructor() {
-    this.peers = new Map();
-    this.connections = new Map(); // WebSocket connections
-    this.lastCleanup = Date.now();
+    this.routingTable = new Map();
   }
 
-  addPeer(peerId, peerData) {
-    const peer = {
+  addPeer(peerId, walletAddress, socketId) {
+    this.routingTable.set(peerId, {
       id: peerId,
-      ...peerData,
+      walletAddress,
+      socketId,
       lastSeen: Date.now(),
-      joined: Date.now()
-    };
-    
-    this.peers.set(peerId, peer);
-    console.log(`Peer joined: ${peerId} (Total: ${this.peers.size})`);
-    return peer;
+      connections: 0
+    });
+    console.log(`✅ Peer added to DHT: ${walletAddress.substring(0, 8)}... (${this.routingTable.size} total)`);
   }
 
   removePeer(peerId) {
-    const removed = this.peers.delete(peerId);
-    this.connections.delete(peerId);
-    if (removed) {
-      console.log(`Peer left: ${peerId} (Total: ${this.peers.size})`);
-    }
-    return removed;
-  }
-
-  updatePeerActivity(peerId) {
-    const peer = this.peers.get(peerId);
+    const peer = this.routingTable.get(peerId);
     if (peer) {
-      peer.lastSeen = Date.now();
-      this.peers.set(peerId, peer);
+      console.log(`❌ Peer removed from DHT: ${peer.walletAddress.substring(0, 8)}...`);
+      this.routingTable.delete(peerId);
     }
   }
 
-  getActivePeers(maxAge = 300000) { // 5 minutes default
-    const now = Date.now();
-    const activePeers = [];
+  findClosestPeers(targetWalletAddress, k = 20) {
+    const targetHash = this.hashAddress(targetWalletAddress);
     
-    for (const [peerId, peer] of this.peers) {
-      if (now - peer.lastSeen < maxAge) {
-        activePeers.push(peer);
+    const peersWithDistance = Array.from(this.routingTable.values())
+      .map(peer => ({
+        peer,
+        distance: this.xorDistance(
+          targetHash,
+          this.hashAddress(peer.walletAddress)
+        )
+      }))
+      .sort((a, b) => a.distance.localeCompare(b.distance))
+      .slice(0, k)
+      .map(item => item.peer);
+
+    return peersWithDistance;
+  }
+
+  hashAddress(address) {
+    return crypto.createHash('sha256').update(address).digest('hex');
+  }
+
+  xorDistance(hash1, hash2) {
+    let distance = '';
+    for (let i = 0; i < Math.min(hash1.length, hash2.length); i++) {
+      const xor = parseInt(hash1[i], 16) ^ parseInt(hash2[i], 16);
+      distance += xor.toString(16);
+    }
+    return distance;
+  }
+
+  getAllPeers() {
+    return Array.from(this.routingTable.values());
+  }
+
+  getPeerCount() {
+    return this.routingTable.size;
+  }
+
+  cleanup() {
+    const timeout = 10 * 60 * 1000; // 10 minutes
+    const now = Date.now();
+    let removed = 0;
+
+    for (const [peerId, peer] of this.routingTable.entries()) {
+      if (now - peer.lastSeen > timeout) {
+        this.routingTable.delete(peerId);
+        removed++;
       }
     }
-    
-    return activePeers;
-  }
 
-  cleanupStalePeers(maxAge = CONFIG.PEER_TIMEOUT) {
-    const now = Date.now();
-    const stalePeers = [];
-    
-    for (const [peerId, peer] of this.peers) {
-      if (now - peer.lastSeen > maxAge) {
-        stalePeers.push(peerId);
-      }
+    if (removed > 0) {
+      console.log(`🧹 Cleaned up ${removed} inactive peers`);
     }
-    
-    stalePeers.forEach(peerId => this.removePeer(peerId));
-    return stalePeers.length;
-  }
-
-  getRandomPeers(count = 10, excludePeerId = null) {
-    const activePeers = this.getActivePeers().filter(peer => peer.id !== excludePeerId);
-    
-    // Shuffle and return up to count peers
-    const shuffled = activePeers.sort(() => 0.5 - Math.random());
-    return shuffled.slice(0, count);
   }
 }
 
-const peerManager = new PeerManager();
+const dht = new DHTNode();
 
-// Cleanup stale peers automatically
-setInterval(() => {
-  const cleanedUp = peerManager.cleanupStalePeers();
-  if (cleanedUp > 0) {
-    console.log(`Cleaned up ${cleanedUp} stale peers`);
-  }
-}, CONFIG.CLEANUP_INTERVAL);
-
-// API Routes
-
-// Health check endpoint
-app.get('/health', (req, res) => {
+// HTTP Routes
+app.get('/', (req, res) => {
   res.json({
-    status: 'healthy',
-    timestamp: Date.now(),
-    serverId: CONFIG.SERVER_ID,
-    totalPeers: peerManager.peers.size,
-    activePeers: peerManager.getActivePeers().length,
+    name: 'Nexus Bootstrap Server',
+    version: '1.0.0',
+    peers: dht.getPeerCount(),
     uptime: process.uptime()
   });
 });
 
-// MAIN ENDPOINT: Get peer list for DHT bootstrap
-app.get('/peers', (req, res) => {
-  try {
-    const requestingPeerId = req.query.peerId;
-    const maxPeers = parseInt(req.query.limit) || 10;
-    
-    const peers = peerManager.getRandomPeers(maxPeers, requestingPeerId);
-    
-    res.json({
-      success: true,
-      peers: peers.map(peer => ({
-        id: peer.id,
-        address: peer.address || 'unknown',
-        port: peer.port || 8080,
-        lastSeen: peer.lastSeen,
-        capabilities: peer.capabilities || ['dht', 'webrtc']
-      })),
-      totalAvailable: peerManager.getActivePeers().length,
-      bootstrapServer: CONFIG.SERVER_ID,
-      timestamp: Date.now()
-    });
-  } catch (error) {
-    console.error('Error getting peers:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// Register peer with network
-app.post('/announce', (req, res) => {
-  try {
-    const { peerId, address, port, capabilities } = req.body;
-    
-    if (!peerId) {
-      return res.status(400).json({ success: false, error: 'peerId is required' });
-    }
-    
-    const peer = peerManager.addPeer(peerId, {
-      address: address || req.ip,
-      port: port || 8080,
-      capabilities: capabilities || ['dht', 'webrtc']
-    });
-    
-    res.json({
-      success: true,
-      peer,
-      message: 'Peer announced successfully',
-      bootstrapServer: CONFIG.SERVER_ID
-    });
-  } catch (error) {
-    console.error('Error announcing peer:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// Update peer activity (heartbeat)
-app.post('/heartbeat', (req, res) => {
-  try {
-    const { peerId } = req.body;
-    
-    if (!peerId) {
-      return res.status(400).json({ success: false, error: 'peerId is required' });
-    }
-    
-    peerManager.updatePeerActivity(peerId);
-    
-    res.json({
-      success: true,
-      message: 'Heartbeat updated',
-      timestamp: Date.now()
-    });
-  } catch (error) {
-    console.error('Error updating heartbeat:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// WebRTC Signaling endpoint
-app.post('/signal', (req, res) => {
-  try {
-    const { to, from, message } = req.body;
-    
-    if (!to || !from || !message) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'to, from, and message are required' 
-      });
-    }
-    
-    // Forward via WebSocket if available
-    const targetConnection = peerManager.connections.get(to);
-    if (targetConnection && targetConnection.readyState === WebSocket.OPEN) {
-      targetConnection.send(JSON.stringify({
-        type: 'signaling',
-        from,
-        to,
-        message
-      }));
-      
-      res.json({ success: true, message: 'Signal forwarded via WebSocket' });
-    } else {
-      res.json({ 
-        success: false, 
-        error: 'Target peer not connected',
-        suggestion: 'Peer should connect via WebSocket for signaling'
-      });
-    }
-  } catch (error) {
-    console.error('Error handling signal:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// Network statistics
-app.get('/stats', (req, res) => {
-  const stats = {
-    serverId: CONFIG.SERVER_ID,
-    totalPeers: peerManager.peers.size,
-    activePeers: peerManager.getActivePeers().length,
-    webSocketConnections: peerManager.connections.size,
-    uptime: process.uptime(),
-    memoryUsage: process.memoryUsage(),
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'healthy',
+    peers: dht.getPeerCount(),
     timestamp: Date.now()
-  };
-  
-  res.json(stats);
+  });
 });
 
-// WebSocket server for real-time signaling
-const wss = new WebSocket.Server({ server });
+app.get('/peers', (req, res) => {
+  const allPeers = dht.getAllPeers().map(p => ({
+    id: p.id,
+    walletAddress: p.walletAddress,
+    lastSeen: p.lastSeen,
+    connections: p.connections
+  }));
+  
+  res.json({
+    total: allPeers.length,
+    peers: allPeers
+  });
+});
 
-wss.on('connection', (ws, req) => {
-  let peerId = null;
+app.get('/stats', (req, res) => {
+  res.json({
+    totalPeers: dht.getPeerCount(),
+    activeConnections: io.sockets.sockets.size,
+    uptime: process.uptime(),
+    memory: process.memoryUsage()
+  });
+});
+
+// Socket.IO Events
+io.on('connection', (socket) => {
+  console.log(`🔌 New connection: ${socket.id}`);
   
-  console.log('New WebSocket connection established');
-  
-  ws.on('message', (data) => {
-    try {
-      const message = JSON.parse(data);
-      
-      switch (message.type) {
-        case 'register':
-          peerId = message.peerId;
-          if (peerId) {
-            peerManager.connections.set(peerId, ws);
-            peerManager.updatePeerActivity(peerId);
-            console.log(`Peer ${peerId} registered WebSocket`);
-            
-            ws.send(JSON.stringify({
-              type: 'registered',
-              peerId,
-              serverId: CONFIG.SERVER_ID,
-              timestamp: Date.now()
-            }));
-          }
-          break;
-          
-        case 'signaling':
-          const { to, from, signalingMessage } = message;
-          const targetConnection = peerManager.connections.get(to);
-          
-          if (targetConnection && targetConnection.readyState === WebSocket.OPEN) {
-            targetConnection.send(JSON.stringify({
-              type: 'signaling',
-              from,
-              to,
-              message: signalingMessage
-            }));
-          }
-          break;
-          
-        case 'heartbeat':
-          if (message.peerId) {
-            peerManager.updatePeerActivity(message.peerId);
-          }
-          break;
-          
-        default:
-          console.log('Unknown WebSocket message type:', message.type);
+  let currentPeerId = null;
+
+  // Peer registration
+  socket.on('register', (data) => {
+    const { walletAddress, peerId } = data;
+    
+    if (!walletAddress) {
+      socket.emit('error', { message: 'Wallet address required' });
+      return;
+    }
+
+    currentPeerId = peerId || socket.id;
+    
+    // Add to DHT
+    dht.addPeer(currentPeerId, walletAddress, socket.id);
+    
+    // Store peer info
+    peers.set(socket.id, {
+      id: currentPeerId,
+      walletAddress,
+      socketId: socket.id,
+      connectedAt: Date.now()
+    });
+
+    // Send confirmation
+    socket.emit('registered', {
+      peerId: currentPeerId,
+      bootstrapNode: true
+    });
+
+    // Broadcast new peer to others
+    socket.broadcast.emit('peer-joined', {
+      peerId: currentPeerId,
+      walletAddress
+    });
+
+    console.log(`✅ Peer registered: ${walletAddress.substring(0, 8)}... as ${currentPeerId}`);
+  });
+
+  // DHT: Find node
+  socket.on('find-node', (data) => {
+    const { targetWalletAddress, k } = data;
+    console.log(`🔍 Find node request for: ${targetWalletAddress?.substring(0, 8)}...`);
+
+    const closestPeers = dht.findClosestPeers(targetWalletAddress, k || 20);
+    
+    socket.emit('found-nodes', {
+      peers: closestPeers.map(p => ({
+        id: p.id,
+        walletAddress: p.walletAddress,
+        socketId: p.socketId
+      }))
+    });
+
+    console.log(`📤 Sent ${closestPeers.length} closest peers`);
+  });
+
+  // Get all peers
+  socket.on('get-peers', () => {
+    const allPeers = dht.getAllPeers().map(p => ({
+      id: p.id,
+      walletAddress: p.walletAddress
+    }));
+
+    socket.emit('peers-list', { peers: allPeers });
+  });
+
+  // WebRTC Signaling: Forward signals between peers
+  socket.on('signal', (data) => {
+    const { to, from, signal } = data;
+    
+    // Find target peer
+    const targetPeer = Array.from(peers.values()).find(p => p.id === to);
+    
+    if (targetPeer) {
+      io.to(targetPeer.socketId).emit('signal', {
+        from,
+        signal
+      });
+      console.log(`📨 Forwarded signal: ${from?.substring(0, 8)} → ${to?.substring(0, 8)}`);
+    } else {
+      socket.emit('error', { message: 'Peer not found', peerId: to });
+    }
+  });
+
+  // Peer announcement (gossip)
+  socket.on('announce', (data) => {
+    socket.broadcast.emit('peer-announcement', data);
+  });
+
+  // Ping/Pong for keepalive
+  socket.on('ping', () => {
+    socket.emit('pong', { timestamp: Date.now() });
+    
+    // Update last seen
+    if (currentPeerId) {
+      const peer = dht.routingTable.get(currentPeerId);
+      if (peer) {
+        peer.lastSeen = Date.now();
       }
-    } catch (error) {
-      console.error('Error parsing WebSocket message:', error);
     }
   });
-  
-  ws.on('close', () => {
-    if (peerId) {
-      peerManager.connections.delete(peerId);
-      console.log(`Peer ${peerId} disconnected from WebSocket`);
+
+  // Disconnect
+  socket.on('disconnect', () => {
+    console.log(`🔌 Disconnected: ${socket.id}`);
+    
+    if (currentPeerId) {
+      dht.removePeer(currentPeerId);
+      
+      // Notify other peers
+      socket.broadcast.emit('peer-left', {
+        peerId: currentPeerId
+      });
     }
+    
+    peers.delete(socket.id);
   });
-  
-  ws.on('error', (error) => {
-    console.error('WebSocket error:', error);
+
+  // Error handling
+  socket.on('error', (error) => {
+    console.error('Socket error:', error);
   });
 });
 
-// Start server with hardcoded port
-const PORT = CONFIG.PORT;
+// Periodic cleanup
+setInterval(() => {
+  dht.cleanup();
+}, 5 * 60 * 1000); // Every 5 minutes
+
+// Server startup
+const PORT = process.env.PORT || 3000;
+
 server.listen(PORT, () => {
-  console.log(`=================================`);
-  console.log(`Nexus Bootstrap Server RUNNING`);
-  console.log(`=================================`);
-  console.log(`Server ID: ${CONFIG.SERVER_ID}`);
-  console.log(`Port: ${PORT}`);
-  console.log(`Environment: ${CONFIG.NODE_ENV}`);
-  console.log(`HTTP API: http://localhost:${PORT}`);
-  console.log(`WebSocket: ws://localhost:${PORT}`);
-  console.log(`Health Check: http://localhost:${PORT}/health`);
-  console.log(`=================================`);
+  console.log(`
+╔════════════════════════════════════════╗
+║   Nexus Bootstrap Server Running      ║
+║   Port: ${PORT}                         ║
+║   Environment: ${process.env.NODE_ENV || 'development'}
+╚════════════════════════════════════════╝
+  `);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('Shutting down gracefully...');
+  console.log('🛑 SIGTERM received, shutting down gracefully...');
   server.close(() => {
-    console.log('Nexus Bootstrap Server closed');
-    process.exit(0);
-  });
-});
-
-process.on('SIGINT', () => {
-  console.log('\nReceived SIGINT, shutting down...');
-  server.close(() => {
-    console.log('Nexus Bootstrap Server closed');
+    console.log('✅ Server closed');
     process.exit(0);
   });
 });
