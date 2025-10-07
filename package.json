@@ -7,26 +7,13 @@
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
-  "keywords": ["p2p", "dht", "bootstrap", "webrtc"],
+  "keywords": ["p2p", "dht", "bootstrap", "webrtc", "signaling"],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "express": "^4.18.2",
-    "socket.io": "^4.6.0",
-    "cors": "^2.8.5",
-    "crypto": "^1.0.1"
-    "react": "18.2.0",
-    "react-native": "0.74.5",
-    "@react-navigation/native": "^6.1.18",
-    "@react-navigation/bottom-tabs": "^6.6.1",
-    "@react-navigation/native-stack": "^6.11.0",
-    "react-native-screens": "^3.34.0",
-    "react-native-safe-area-context": "^4.10.9",
-    "react-native-vector-icons": "^10.1.0",
-    "react-native-webrtc": "^124.0.4",
-    "@react-native-async-storage/async-storage": "^1.24.0",
+    "express": "^4.19.2",
     "ws": "^8.18.0",
-    "express": "^4.19.2""
+    "cors": "^2.8.5"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
